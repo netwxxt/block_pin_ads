@@ -1,6 +1,8 @@
 import json
+import re
 from mitmproxy import http
 
+# Exact fields confirmd via mitmproxy captures / community reverse-engineering
 AD_INDICATOR_KEYS = {
     "is_promoted",
     "is_downstream_promotion",
@@ -18,19 +20,49 @@ AD_INDICATOR_KEYS = {
 }
 
 
+# Word roots seen across every known ad-indicatior field, snake_case or
+# camelCase.
+AD_TOKENS = {
+    "ad", "ads",
+    "promoted", "promotion", "promotions",
+    "sponsor", "sponsored", "sponsorship",
+    "advertiser", "advertisers", "advertising",
+    "campaign", "campaigns",
+    "adgroup",
+}
+
+PREFILTER_SUBSTRINGS = (
+    "prompt", "sponsor", "advertis", "campaign", "adgroup",
+)
+
+
+_CAMEL_BOUNDARY = re.compile(r"([a-z0-9])([A-Z])")
+
+def _tokens(key: str) -> list[str]:
+    snaked = _CAMEL_BOUNDARY.sub(r"\1_\2", key)
+    return [t.lower() for t in snaked.split("_") if t]
+
+def is_ad_key(key: str) -> bool:
+    return not AD_TOKENS.isdisjoint(_tokens(key))
+
+
+def _truthy(val) -> bool:
+    if val is True:
+        return True
+    if isinstance(val, str):
+        return bool(val.strip())
+    if isinstance(val, dict):
+        return bool(val)
+    if isinstance(val, (int, float)):
+        return bool(val)
+    return False
+
+
 def is_ad_pin(obj: dict) -> bool:
-    for key in AD_INDICATOR_KEYS:
-        if key not in obj:
-            continue
-        val = obj[key]
-        if val is True:
-            return True
-        if isinstance(val, str) and val.strip():
-            return True
-        if isinstance(val, dict) and val:
-            return True
-        if isinstance(val, (int, float)) and val:
-            return True
+    for key, val in obj.items():
+        if key in AD_INDICATOR_KEYS or is_ad_key(key):
+            if _truthy(val):
+                return True
     return False
 
 
@@ -64,7 +96,9 @@ def response(flow: http.HTTPFlow) -> None:
     if "application/json" in content_type:
         try:
             text = flow.response.get_text()
-            if not any(key in text for key in AD_INDICATOR_KEYS):
+            if not any(s in text for s in PREFILTER_SUBSTRINGS) and not any(
+                key in text for key in AD_INDICATOR_KEYS
+            ):
                 return
             data = json.loads(text)
             scrub(data)
