@@ -79,7 +79,20 @@ def scrub(obj: Any) -> None:
             i += 1
 
 
+def is_pinterest(flow: http.HTTPFlow) -> bool:
+    host = (flow.request.pretty_host or "").lower()
+    sni = (getattr(flow.client_conn, "sni", None) or "").lower()
+    return (
+        "pinterest.com" in host
+        or "pinterest.com" in sni
+        or "pinimg.com" in host
+        or "pinimg.com" in sni
+    )
+
+
 def response(flow: http.HTTPFlow) -> None:
+    if not is_pinterest(flow):
+        return
     if flow.response is None:
         return
 
