@@ -4,7 +4,7 @@ After=network.target tailscaled.service
 
 [Service]
 Type=simple
-ExecStart=/opt/mitm-venv/bin/mitmdump --mode transparent -s /opt/pinterest-adblock/strip_ads.py --listen-host 0.0.0.0 --listen-port 8080
+ExecStart=/opt/mitm-venv/bin/mitmdump --mode wireguard -s /opt/pinterest-adblock/strip_ads.py --listen-host 0.0.0.0 --listen-port 8080
 Restart=on-failure
 User=mitmproxy
 Group=mitmproxy

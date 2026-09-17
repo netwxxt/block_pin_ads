@@ -1,107 +1,156 @@
-# Pinterest Ad Blocker (mitmproxy + Tailscale)
+README.md
+markdown
 
-Strips promoted pins from Pinterest's iOS app/website by intercepting and modifying API responses in transit. Runs as a systemd service in an LXC container, reached from an iPhone via Tailscale exit-node routing.
+# Pinterest Ad Blocker (mitmproxy WireGuard mode)
+
+Strips promoted pins from Pinterest's iOS app/website by intercepting and modifying API responses in transit. Runs as a systemd service in an LXC container. An iPhone on the same LAN connects directly to it via a WireGuard profile in the WireGuard iOS app.
+
+## Scope
+
+**Local network only.** The iPhone must be on the same LAN as the server. There is no remote-access path (no Tailscale, no exit node, no port-forwarding). This is by design — iOS permits only one active VPN profile, and running a mesh VPN alongside the WireGuard tunnel is a losing battle.
 
 ## How it works
 
-Pinterest has no separate ad domain — ads and organic pins both come from `api.pinterest.com`/`pinimg.com`, so DNS blocking (Pi-hole style) can't work. Instead, `mitmproxy` transparently intercepts HTTPS traffic, and its addon (`strip_ads.py`) walks every JSON response, deleting any pin object with an ad-indicator field (`is_promoted`, `advertiserId`, etc., in either snake_case or camelCase) before it reaches the app.
+Pinterest has no separate ad domain — ads and organic pins both come from `api.pinterest.com`/`pinimg.com`, so DNS blocking (Pi-hole style) can't work. Instead, `mitmproxy` runs as a WireGuard server: the iPhone's WireGuard profile routes all traffic through it, and the addon (`strip_ads.py`) walks every JSON response, deleting any pin object with an ad-indicator field (`is_promoted`, `advertiserId`, etc., in either snake_case or camelCase) before it reaches the app.
 
-Traffic path: `iPhone --(Tailscale exit node)--> LXC (mitmproxy) --> Pinterest`, scrubbed on the way back.
+Traffic path: `iPhone --(WireGuard)--> LXC (mitmproxy) --> Pinterest`, scrubbed on the way back.
 
 ## Architecture
 
-```
-/opt/mitm-venv/                    Python venv with mitmproxy
-/opt/pinterest-adblock/strip_ads.py   The addon (edit AD_INDICATOR_KEYS / AD_TOKENS to update detection)
-/etc/systemd/system/pinterest-adblock.service   Runs mitmdump as the `mitmproxy` user
-```
+/opt/mitm-venv/ Python venv with mitmproxy
+/opt/mitm-venv/.mitmproxy/wireguard.conf WireGuard server config (server_key, client_key)
+/opt/pinterest-adblock/strip_ads.py The addon (edit AD_INDICATOR_KEYS / AD_TOKENS to update detection)
+/etc/systemd/system/pinterest-adblock.service Runs mitmdump as the mitmproxy user
+text
 
-Runs as a dedicated non-root user (`mitmproxy`). Always manage via `systemctl`, not by hand-running `mitmdump`
+
+Runs as a dedicated non-root user (`mitmproxy`). Always manage via `systemctl`, not by hand-running `mitmdump`.
 
 ## One-time setup
 
 **1. LXC prerequisites**
-- Debian/Ubuntu LXC (unprivileged fine), Tailscale installed and `tailscale up`.
-- Enable IP forwarding:
-  ```bash
-  echo 'net.ipv4.ip_forward=1' | sudo tee -a /etc/sysctl.conf
-  echo 'net.ipv6.conf.all.forwarding=1' | sudo tee -a /etc/sysctl.conf
-  sudo sysctl -p
-  ```
-  If it won't stick in an unprivileged LXC, set `lxc.sysctl.net.ipv4.ip_forward = 1` in the container's Proxmox config on the host, then `pct restart <id>`.
-- Advertise as exit node, then approve in the [Tailscale admin console](https://login.tailscale.com/admin/machines):
-  ```bash
-  sudo tailscale up --advertise-exit-node
-  ```
+
+Debian/Ubuntu LXC (unprivileged fine). Nothing Tailscale-related is needed. Ensure UDP port `8080` is reachable from your LAN to the container (for Proxmox, this is handled by the LXC's bridge unless you have a firewall in the path).
 
 **2. Python environment**
+
 ```bash
 sudo useradd -r -s /usr/sbin/nologin -d /opt/mitm-venv mitmproxy
 sudo mkdir -p /opt/mitm-venv /opt/pinterest-adblock
 sudo chown -R mitmproxy:mitmproxy /opt/mitm-venv /opt/pinterest-adblock
 sudo -u mitmproxy python3 -m venv /opt/mitm-venv
 sudo -u mitmproxy /opt/mitm-venv/bin/pip install mitmproxy
-```
 
-**3. Deploy the addon**
-```bash
+3. Deploy the addon
+bash
+
 sudo chown mitmproxy:mitmproxy /opt/pinterest-adblock/strip_ads.py
-```
 
-**4. systemd service** — `/etc/systemd/system/pinterest-adblock.service`:
-```ini
+4. First run — generate the WireGuard config
+
+Run mitmdump once by hand as the mitmproxy user so it creates /opt/mitm-venv/.mitmproxy/wireguard.conf and prints a client config template to the console:
+bash
+
+sudo -u mitmproxy /opt/mitm-venv/bin/mitmdump \
+  --mode wireguard \
+  -s /opt/pinterest-adblock/strip_ads.py \
+  --listen-host 0.0.0.0 --listen-port 8080
+
+Copy the printed template somewhere safe, then Ctrl+C. The server's public key (needed for the iPhone) is derived from server_key in the config file — see step 7.
+
+5. systemd service — /etc/systemd/system/pinterest-adblock.service:
+ini
+
 [Unit]
-Description=mitmproxy Pinterest ad stripper
-After=network.target tailscaled.service
+Description=mitmproxy Pinterest ad stripper (WireGuard mode)
+After=network.target
 
 [Service]
 Type=simple
-ExecStart=/opt/mitm-venv/bin/mitmdump --mode transparent -s /opt/pinterest-adblock/strip_ads.py --listen-host 0.0.0.0 --listen-port 8080
+Environment=HOME=/opt/mitm-venv
+ExecStart=/opt/mitm-venv/bin/mitmdump --mode wireguard -s /opt/pinterest-adblock/strip_ads.py --listen-host 0.0.0.0 --listen-port 8080
 Restart=on-failure
 User=mitmproxy
 Group=mitmproxy
 
 [Install]
 WantedBy=multi-user.target
-```
-```bash
+
+bash
+
 sudo systemctl daemon-reload
 sudo systemctl enable --now pinterest-adblock
-```
-Optional: add `--set ignore_hosts=".*\.pinimg\.com"` to skip TLS interception for the CDN (pure perf optimization; not required for correctness).
 
-**5. iptables transparent redirect**
-```bash
-sudo apt install -y iptables-persistent
-sudo iptables -t nat -A PREROUTING -i tailscale0 -p tcp --dport 80 -j REDIRECT --to-port 8080
-sudo iptables -t nat -A PREROUTING -i tailscale0 -p tcp --dport 443 -j REDIRECT --to-port 8080
-sudo netfilter-persistent save
-```
+6. Authorize the iPhone on the server
 
-**6. iPhone setup**
-1. Install Tailscale app, sign into the same tailnet.
-2. Tailscale app → **Exit Node** → select this LXC.
-3. With exit node active, Safari → `http://mitm.it` → download the mitmproxy CA cert.
-4. **Settings → General → VPN & Device Management** → install the profile.
-5. **Settings → General → About → Certificate Trust Settings** → enable full trust for the mitmproxy cert. *(Easy to miss — skipping this causes "Not Private Connection" errors.)*
+The wireguard.conf file looks like this:
+json
 
-Other devices will have a similar process to this, tailscale, exit node, cert, trusting cert, good-to-go.
+{
+    "server_key": "<server private key>",
+    "client_key": "<client private key>"
+}
 
-## Day-to-day use
+⚠️ Quirk: despite the name, client_key must be the iPhone's private key — not its public key. mitmproxy derives the authorized public key from this value, so putting the iPhone's public key here will cause Received WireGuard packet from unknown peer and the handshake will fail. Edit as the mitmproxy user so permissions stick:
+bash
 
-Nothing to do — as long as the exit node is selected and the service is running, Pinterest traffic is scrubbed automatically. Deselect the exit node to turn off.
+sudo -u mitmproxy nano /opt/mitm-venv/.mitmproxy/wireguard.conf
 
-If ads reappear right after switching the exit node on, see [Stale connections](#stale-connections-after-switching-exit-nodes) before assuming detection broke.
+Paste the PrivateKey value from your iPhone's WireGuard tunnel into client_key. Leave server_key untouched.
 
-## Detection logic
+7. iPhone setup
+
+Install the WireGuard app from the App Store, then create a tunnel with the following. You can also import the template mitmproxy printed in step 4 and just fix the fields below.
+ini
+
+[Interface]
+PrivateKey = <iPhone's private key — auto-generated by the app>
+Address = 10.0.0.1/32
+DNS = 10.0.0.53
+
+[Peer]
+PublicKey = <server's public key — see below>
+AllowedIPs = 0.0.0.0/0
+Endpoint = <server LAN IP>:8080
+
+    <server LAN IP> is the LXC's address on your home network (e.g. 192.168.1.50). Not 0.0.0.0.
+
+    <server's public key> is derived from server_key on the server:
+    bash
+
+    grep server_key /opt/mitm-venv/.mitmproxy/wireguard.conf | cut -d'"' -f4 | wg pubkey
+
+    (If wg isn't installed, apt install wireguard-tools.)
+
+Save and toggle the tunnel on.
+
+8. Install the mitmproxy CA cert on the iPhone
+
+With the WireGuard tunnel active:
+
+    Safari → http://mitm.it → tap the iOS/Apple icon → download the mitmproxy CA cert.
+
+    Settings → General → VPN & Device Management → install the profile.
+
+    Settings → General → About → Certificate Trust Settings → enable full trust for the mitmproxy cert. (Easy to miss — skipping this causes "Not Private Connection" errors.)
+
+Now open Pinterest. Ads should be gone.
+Day-to-day use
+
+Toggle the WireGuard tunnel on/off in the WireGuard app. That's it — while it's on, all Pinterest traffic is scrubbed. Turning the tunnel off restores normal browsing.
+
+If ads reappear right after toggling the tunnel on, see Stale connections before assuming detection broke.
+Detection logic
 
 A pin is deleted from its list if any key matches (and its value is truthy):
-- `AD_INDICATOR_KEYS` — exact known field names (documented anchor list).
-- `AD_TOKENS` — word roots (`promoted`, `sponsor`, `advertiser`, `campaign`, `adgroup`, `ad`) matched against each key's tokenized form (splits both snake_case and camelCase), so `is_promoted`, `isPromoted`, `advertiserId` all match on root alone. Matching is whole-token only — `added_at` doesn't match `ad`.
 
-Every JSON response is parsed and walked unconditionally
+    AD_INDICATOR_KEYS — exact known field names (documented anchor list).
 
-```python
+    AD_TOKENS — word roots (promoted, sponsor, advertiser, campaign, adgroup, ad) matched against each key's tokenized form (splits both snake_case and camelCase), so is_promoted, isPromoted, advertiserId all match on root alone. Matching is whole-token only — added_at doesn't match ad.
+
+Every JSON response is parsed and walked unconditionally.
+python
+
 AD_INDICATOR_KEYS = {
     "is_promoted", "is_downstream_promotion", "pin_promotion_id",
     "ad_data", "advertiser_id", "sponsorship",
@@ -116,44 +165,76 @@ AD_TOKENS = {
     "advertiser", "advertisers", "advertising",
     "campaign", "campaigns", "adgroup",
 }
-```
 
-## Maintenance
+Maintenance
 
 Detection is root-based, so most Pinterest field renames need no code change. If ads reappear:
-1. Rule out the [stale-connection issue](#stale-connections-after-switching-exit-nodes) first — looks identical to a detection failure.
-2. Capture fresh traffic to see current pin JSON (stop the service, run `mitmdump` manually as the `mitmproxy` user with `-w /tmp/capture.mitm`, then inspect with `mitmproxy -r /tmp/capture.mitm`).
-3. Check logs: `sudo journalctl -u pinterest-adblock -f`
-4. If a genuinely new root word appears, add it to `AD_TOKENS` (or `AD_INDICATOR_KEYS` if too generic to token-match safely — never add bare `"is"`/`"id"`).
-5. `sudo systemctl restart pinterest-adblock`
 
-## Stale connections after switching exit nodes
+    Rule out the stale-connection issue first — looks identical to a detection failure.
 
-**Symptom:** ads reappear, or exist and are frozen right after toggling on the exit node, even though the service is fine.
-**Cause:** the app's existing TCP/TLS connections keep using their old path until closed — bypassing the proxy — until a full Tailscale off/on rebuilds the tunnel.
-**Fix:** after selecting the exit node, fully restart the tailscale service on your device, and reload Pinterest as well. If ads persist after that, it's a real detection issue — see Maintenance.
+    Capture fresh traffic to see current pin JSON (stop the service, run mitmdump manually as the mitmproxy user with -w /tmp/capture.mitm, then inspect with mitmproxy -r /tmp/capture.mitm).
 
-## Running by hand
+    Check logs: sudo journalctl -u pinterest-adblock -f
 
-Never run `mitmdump` with plain `sudo` — it resets `$HOME` to `/root`, causing mitmproxy to generate a brand-new untrusted CA (breaks TLS for everything). Always run as the `mitmproxy` user, matching the service's environment:
-```bash
+    If a genuinely new root word appears, add it to AD_TOKENS (or AD_INDICATOR_KEYS if too generic to token-match safely — never add bare "is"/"id").
+
+    sudo systemctl restart pinterest-adblock
+
+Stale connections after toggling the tunnel
+
+Symptom: ads reappear, or existing pins appear frozen, right after toggling the WireGuard tunnel on — even though the service is fine.
+
+Cause: Pinterest's existing TCP/TLS connections keep using their old (pre-VPN) path until they're closed, bypassing the proxy until the tunnel rebuilds them.
+
+Fix: after enabling the tunnel, force-quit and reopen Pinterest. If ads persist after that, it's a real detection issue — see Maintenance.
+Running by hand
+
+Never run mitmdump with plain sudo — it resets $HOME to /root, causing mitmproxy to generate a brand-new untrusted CA (breaks TLS for everything) and to look for the WireGuard config in the wrong place. Always run as the mitmproxy user, matching the service's environment:
+bash
+
 sudo -u mitmproxy /opt/mitm-venv/bin/mitmdump ...
-```
 
-## Troubleshooting
+Troubleshooting
+Symptom	Cause	Fix
+Received WireGuard packet from unknown peer	client_key in wireguard.conf isn't the iPhone's private key	See step 6
+Tunnel connects, nothing intercepted	Endpoint in iPhone config is 0.0.0.0, not the LAN IP	Fix Endpoint — must be <server LAN IP>:8080
+"Not Private Connection" everywhere	Cert not fully trusted	Settings → Certificate Trust Settings
+TLS fails for every domain	New untrusted CA from running mitmdump with plain sudo	See Running by hand
+Ads reappear right after toggling the tunnel	Stale connections	See Stale connections
+Service won't start	Script error or bad ExecStart path	sudo journalctl -u pinterest-adblock -n 50 --no-pager
+No traffic in logs	iPhone not connected, or wrong LAN IP / port	Verify UDP 8080 reachable from LAN
+Ads still appear despite matches	Ad field is nested differently than expected	Capture and inspect live JSON
+Known limitations
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| "Not Private Connection" everywhere | Cert not fully trusted | Settings → Certificate Trust Settings |
-| TLS fails for *every* domain | New untrusted CA from running `mitmdump` with plain `sudo` | See [Running by hand](#running-by-hand) |
-| Ads reappear right after switching exit nodes | Stale connections | See [Stale connections](#stale-connections-after-switching-exit-nodes) |
-| Service won't start | Script error or bad `ExecStart` path | `sudo journalctl -u pinterest-adblock -n 50 --no-pager` |
-| No traffic in logs | Exit node not selected, or IP forwarding off | `tailscale status`; `cat /proc/sys/net/ipv4/ip_forward` |
-| Ads still appear despite matches | Ad field is nested differently than expected | Capture and inspect live JSON |
+    Routes all iPhone traffic through the LXC while the tunnel is active, not just Pinterest.
 
-## Known limitations
+    Local network only — no remote use.
 
-- Routes **all** iPhone traffic through the LXC, not just Pinterest.
-- Pagination may shift slightly since ads are stripped after Pinterest already counted them into the page.
-- Would break entirely if Pinterest ever added cert pinning (currently doesn't).
-- Fragile to Pinterest API changes; occasional maintenance needed.
+    Pagination may shift slightly since ads are stripped after Pinterest already counted them into the page.
+
+    Would break entirely if Pinterest ever added cert pinning (currently doesn't).
+
+    Fragile to Pinterest API changes; occasional maintenance needed.
+
+text
+
+
+---
+
+## `pinterest-adblock.service`
+
+```ini
+[Unit]
+Description=mitmproxy Pinterest ad stripper (WireGuard mode)
+After=network.target
+
+[Service]
+Type=simple
+Environment=HOME=/opt/mitm-venv
+ExecStart=/opt/mitm-venv/bin/mitmdump --mode wireguard -s /opt/pinterest-adblock/strip_ads.py --listen-host 0.0.0.0 --listen-port 8080
+Restart=on-failure
+User=mitmproxy
+Group=mitmproxy
+
+[Install]
+WantedBy=multi-user.target
